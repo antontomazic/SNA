@@ -1,0 +1,592 @@
+# Import necessary libraries
+import tkinter as tk
+from tkinter import *
+from tkinter import font as tkFont
+from tkinter import ttk
+from tkinter import messagebox
+import numpy as np
+from time import sleep
+import serial
+import serial.tools.list_ports  # Import list_ports
+from tkinter import simpledialog
+import time # Import time
+
+# ================ Serial Port Menu Functions =========================
+def open_serial_port():
+    global SERIALPORT
+    global BAUD
+
+    try:
+        SERIALPORT = com_port_var.get()
+        BAUD = int(baud_rate_var.get())
+
+        messagebox.showinfo("Success", f"COM Port set to {SERIALPORT} at {BAUD} baud") # Confirmed settings.
+
+    except ValueError:
+        messagebox.showerror("Error", "Invalid baud rate. Please enter an integer.")
+
+
+# ================ Variable Definitions ===============================
+graphWidth = 1500
+graphHeight = 700
+graphLeftBuffer = 50
+graphTopBuffer = 50
+graphBottomBuffer = 50
+graphRightBuffer = 20
+graphAreaWidth = graphWidth + graphLeftBuffer + graphRightBuffer
+graphAreaHeight = graphHeight + graphTopBuffer + graphBottomBuffer
+hDiv = 10
+vDiv = 8
+graphColor = 'Green'
+labelColor = 'White'
+traceColor = 'Lime'
+textLabelColor = 'Yellow'
+titleColor = 'LightBlue'
+traceWidth = 1
+dBDivList = [1, 2, 3, 5, 10]
+dBDivIndex = 4
+refLevel = 10
+numSamplesList = [51, 101, 501, 1001]
+numSamplesIndex = 0
+startFreq = 1000000
+stopFreq = 72000000
+SERIALPORT = "COM3"  # Default
+BAUD = 115200      # Default
+traceID = 0
+resetSweep = False
+refReady = False
+measMode = 0
+sweep_running = False
+app_running = True # nova globalna spremenljivka
+
+# Global variables to store marker IDs
+peak_marker_id = None
+valley_marker_id = None
+cursor_text_id = None # nova globalna spremenljivka
+cursor_x = graphLeftBuffer #
+cursor_y = graphTopBuffer
+
+# ================ Function Definitions ===============================
+def UpdateGraph():
+    global graphWidth, graphHeight, graphLeftBuffer, graphTopBuffer # dodano
+    if not app_running: # preverjanje
+        return
+
+    MakeGraph()
+    AddTextInfo()
+    MakeTrace()
+    UpdateCursorText() # Dodano
+
+def MakeGraph():
+    if not app_running: # preverjanje
+        return
+
+    # Get current width and height of canvas for scaling the trace
+    global graphWidth, graphHeight
+    graphWidth = graph.winfo_width() - graphLeftBuffer - graphRightBuffer
+    graphHeight = graph.winfo_height() - graphTopBuffer - graphBottomBuffer
+
+    i = 0
+    xL = graphLeftBuffer
+    xR = graphLeftBuffer + graphWidth
+    dB = refLevel  # Začnemo z refLevel
+    dBStep = dBDivList[dBDivIndex]
+    if measMode == 0:
+        units = "dBm"
+    if measMode == 1:
+        units = "dB"
+    units = "dBm" #default
+    while (i <= vDiv):
+        y = graphTopBuffer + i * graphHeight / vDiv
+        Dline = [xL, y, xR, y]
+        graph.create_line(Dline, fill=graphColor)
+        txt = str(round(dB, 1)) + units  # Uporabimo trenutno vrednost dB
+        graph.create_text(graphLeftBuffer / 2, y - 4, text=txt, fill=labelColor)
+        dB = dB - dBStep  # Zmanjšamo dB za dBStep
+        i = i + 1
+
+    i = 0
+    yT = graphTopBuffer
+    yB = graphTopBuffer + graphHeight
+    freq = startFreq
+    freqStep = (stopFreq - startFreq) / 10
+
+    while (i <= hDiv):
+        x = graphLeftBuffer + i * graphWidth / hDiv
+        Dline = [x, yT, x, yB]
+        graph.create_line(Dline, fill=graphColor)
+        txt = str(np.round(freq / 1000000, 3)) + 'M'
+        graph.create_text(x, graphTopBuffer + 10 + graphHeight, text=txt, fill=labelColor)
+        freq = freq + freqStep
+        i = i + 1
+
+def AddTextInfo():
+    if not app_running: # preverjanje
+        return
+
+    global startFreq, stopFreq, graphWidth, graphLeftBuffer, graphTopBuffer, titleColor, textLabelColor, numSamplesList, numSamplesIndex, refLevel, measMode, dBDivList, dBDivIndex
+    graph.delete("textinfo")  # Delete previous text to avoid overlap
+    yInfo = graphTopBuffer + graphHeight + graphBottomBuffer - 15
+    txt = str(np.round(startFreq / 1000000, 3)) + "MHz to " + str(np.round(stopFreq / 1000000, 3)) + "MHz"
+    graph.create_text(80, yInfo, text=txt, fill=textLabelColor, tag="textinfo")
+    if measMode == 0: units = "dBm"
+    if measMode == 1: units = "dB"
+    txt = "Ref Level: " + str(refLevel) + units
+    graph.create_text(250, yInfo, text=txt, fill=textLabelColor, tag="textinfo")
+    txt = str(dBDivList[dBDivIndex]) + "dB/div"
+    graph.create_text(400, yInfo, text=txt, fill=textLabelColor, tag="textinfo")
+    if measMode == 0: txt = "Mode: Absolute"
+    if measMode == 1: txt = "Mode: Relative"
+    graph.create_text(700, yInfo, text=txt, fill=textLabelColor, tag="textinfo")
+    txt = "Center: " + str(((stopFreq - startFreq) / 2 + startFreq) / 1000000) + "MHz"
+    graph.create_text(graphWidth / 2 + graphLeftBuffer + 250, yInfo, text=txt, fill=textLabelColor, tag="textinfo")
+    txt = str(numSamplesList[numSamplesIndex] - 1) + " samples/sweep"
+    graph.create_text(850, yInfo, text=txt, fill=textLabelColor, tag="textinfo")
+    txt = "Scalar Network Analyzer"
+    graph.create_text(graphWidth / 2 + graphLeftBuffer, graphTopBuffer / 2, text=txt, font=tkFont.Font(size=18),
+                      fill=titleColor, tag="textinfo")
+
+def MakeTrace():
+    if not app_running: # preverjanje
+        return
+
+    global traceID, peak_marker_id, valley_marker_id
+    global traceColor, traceWidth, graphWidth, graphHeight # Make graphWidth and graphHeight global so they are visible
+    global trace, readings, reference, measMode
+    global graphLeftBuffer, graphTopBuffer, dBDivList, dBDivIndex, refLevel, startFreq, stopFreq
+    global peak_freq, peak_dbm, valley_freq, valley_dbm #dodatno
+
+    if measMode == 0:
+        trace[1::2] = graphTopBuffer + (refLevel - readings[1::2]) * (graphHeight / (vDiv * dBDivList[dBDivIndex]))
+        np.clip(trace[1::2], graphTopBuffer, graphTopBuffer + graphHeight, out=trace[1::2])
+        trace[::2] = graphLeftBuffer + (readings[::2] - startFreq) * (graphWidth / (stopFreq - startFreq))
+        np.clip(trace[::2], graphLeftBuffer, graphLeftBuffer + graphWidth, out=trace[::2])
+        tracePlot = trace.astype(int).tolist()
+
+    if measMode == 1:
+        trace[1::2] = graphTopBuffer + (refLevel - readings[1::2] + reference[1::2]) * (
+                    graphHeight / (vDiv * dBDivList[dBDivIndex]))
+        np.clip(trace[1::2], graphTopBuffer, graphTopBuffer + graphHeight, out=trace[1::2])
+        trace[::2] = graphLeftBuffer + (readings[::2] - startFreq) * (graphWidth / (stopFreq - startFreq))
+        np.clip(trace[::2], graphLeftBuffer, graphLeftBuffer + graphWidth, out=trace[::2])
+        tracePlot = trace.astype(int).tolist()
+
+    try:
+        graph.delete(traceID)
+        traceID = graph.create_line(tracePlot, fill=traceColor, width=traceWidth)
+
+        # Find peak and valley indices and values
+        peak_index = np.argmax(readings[1::2]) * 2 + 1 # index * 2 +1 is a dBm value index
+        valley_index = np.argmin(readings[1::2]) * 2 + 1
+
+        global peak_freq, peak_dbm, valley_freq, valley_dbm
+        peak_freq = readings[peak_index - 1] # readings are pairs.
+        peak_dbm = readings[peak_index]
+        valley_freq = readings[valley_index - 1] # readings 0, 2, 4 are frequency
+        valley_dbm = readings[valley_index]
+
+        # Convert frequency to x-coordinate and dBm to y-coordinate for peak
+        peak_x = graphLeftBuffer + (peak_freq - startFreq) * (graphWidth / (stopFreq - startFreq))
+        peak_y = graphTopBuffer + (refLevel - peak_dbm) * (graphHeight / (vDiv * dBDivList[dBDivIndex]))
+
+        # Convert frequency to x-coordinate and dBm to y-coordinate for valley
+        valley_x = graphLeftBuffer + (valley_freq - startFreq) * (graphWidth / (stopFreq - startFreq))
+        valley_y = graphTopBuffer + (refLevel - valley_dbm) * (graphHeight / (vDiv * dBDivList[dBDivIndex]))
+
+        # Delete existing markers
+        if peak_marker_id:
+            graph.delete(peak_marker_id)
+        if valley_marker_id:
+            graph.delete(valley_marker_id)
+
+        # Create peak marker and label
+        peak_marker_id = graph.create_oval(peak_x - 5, peak_y - 5, peak_x + 5, peak_y + 5, fill="Red")
+        graph.create_text(peak_x + 10, peak_y - 10,
+                          text=f"Peak: {peak_freq/1000000:.3f} MHz, {peak_dbm:.2f} dBm", fill="Red", anchor=W)
+
+        # Create valley marker and label
+        valley_marker_id = graph.create_oval(valley_x - 5, valley_y - 5, valley_x + 5, valley_y + 5, fill="Cyan")
+        graph.create_text(valley_x + 10, valley_y - 10,
+                          text=f"Valley: {valley_freq/1000000:.3f} MHz, {valley_dbm:.2f} dBm", fill="Cyan", anchor=W)
+
+        root.update_idletasks()  # Ensure GUI updates.  Important.
+        root.update()
+
+    except Exception as e:
+        print(f"Error during MakeTrace: {e}")
+        pass
+
+def SetupArrays():
+    global resetSweep
+    global readings
+    global trace
+    global stopFreq
+    global startFreq
+    global numSamplesList
+    global numSamplesIndex
+    global measMode
+    global reference
+    fStep = (stopFreq - startFreq) / (numSamplesList[numSamplesIndex] - 1)
+    readings = np.zeros(2 * numSamplesList[numSamplesIndex])
+    readings[::2] = np.arange(numSamplesList[numSamplesIndex]) * (fStep) + startFreq
+    trace = np.zeros(2 * numSamplesList[numSamplesIndex])
+    if measMode == 2: reference = np.zeros(2 * numSamplesList[numSamplesIndex])
+    resetSweep = True
+
+def BdBDivInc():
+    global dBDivIndex
+    global startFreq, stopFreq, graphWidth, graphHeight, graphLeftBuffer, graphTopBuffer, vDiv, dBDivList, refLevel
+    if dBDivIndex >= 4:
+        dBDivIndex = 4
+    else:
+        dBDivIndex = dBDivIndex + 1
+    UpdateGraph()
+
+def BdBDivDec():
+    global dBDivIndex,  startFreq, stopFreq, graphWidth, graphHeight, graphLeftBuffer, graphTopBuffer, vDiv, dBDivList, refLevel
+    if dBDivIndex <= 0:
+        dBDivIndex = 0
+    else:
+        dBDivIndex = dBDivIndex - 1
+    UpdateGraph()
+
+def BrefLevelIncTen():
+    global refLevel,  startFreq, stopFreq, graphWidth, graphHeight, graphLeftBuffer, graphTopBuffer, vDiv, dBDivList
+    refLevel = refLevel + 10
+    if refLevel >= 100:  # Povečana zgornja meja
+        refLevel = 100
+    UpdateGraph()
+
+def BrefLevelDecTen():
+    global refLevel,  startFreq, stopFreq, graphWidth, graphHeight, graphLeftBuffer, graphTopBuffer, vDiv, dBDivList
+    refLevel = refLevel - 10
+    if refLevel <= -60:
+        refLevel = -60
+    UpdateGraph()
+
+def BrefLevelIncOne():
+    global refLevel,  startFreq, stopFreq, graphWidth, graphHeight, graphLeftBuffer, graphTopBuffer, vDiv, dBDivList
+    refLevel = refLevel + 1
+    if refLevel >= 20:
+        refLevel = 20
+    UpdateGraph()
+
+def BrefLevelDecOne():
+    global refLevel,  startFreq, stopFreq, graphWidth, graphHeight, graphLeftBuffer, graphTopBuffer, vDiv, dBDivList
+    refLevel = refLevel - 1
+    if refLevel <= -60:
+        refLevel = -60
+    UpdateGraph()
+
+def BSetFreqs():
+    global startFreq, stopFreq, measMode, readings, trace, numSamplesList, numSamplesIndex  # dodano
+    global graphWidth, graphHeight, graphLeftBuffer, graphTopBuffer, dBDivList, dBDivIndex, refLevel
+    prompt = "Set the sweep starting frequency (MHz):"
+    retVal = simpledialog.askfloat("Set Start Frequency", prompt, parent=root, initialvalue=startFreq / 1000000,
+                                   minvalue=0, maxvalue=72)
+    if retVal is not None:
+        startFreq = retVal * 1000000
+    prompt = "Set the sweep stopping frequency (MHz):"
+    retVal = simpledialog.askfloat("Set Stop Frequency", prompt, parent=root, initialvalue=stopFreq / 1000000,
+                                   minvalue=0, maxvalue=72)
+    if retVal is not None:
+        stopFreq = retVal * 1000000
+    measMode = 0
+    SetupArrays()
+    UpdateGraph()
+
+def BIncSampSweep():
+    global numSamplesIndex, measMode, readings, trace, startFreq, stopFreq,  graphWidth, graphHeight, graphLeftBuffer, graphTopBuffer, dBDivList, dBDivIndex, refLevel
+    if numSamplesIndex >= 5:
+        numSamplesIndex = 5
+    else:
+        numSamplesIndex = numSamplesIndex + 1
+    measMode = 0
+    SetupArrays()
+    UpdateGraph()
+
+def BDecSampSweep():
+    global numSamplesIndex, measMode, readings, trace, startFreq, stopFreq,  graphWidth, graphHeight, graphLeftBuffer, graphTopBuffer, dBDivList, dBDivIndex, refLevel
+    if numSamplesIndex <= 0:
+        numSamplesIndex = 0
+    else:
+        numSamplesIndex = numSamplesIndex - 1
+    measMode = 0
+    SetupArrays()
+    UpdateGraph()
+
+def BCalibrate():
+    global measMode, refReady, reference, readings, app_running, graphWidth, graphHeight, graphLeftBuffer, graphTopBuffer
+    global startFreq, stopFreq, numSamplesList, numSamplesIndex, dBDivList, dBDivIndex, refLevel #dodatno
+    measMode = 2
+    SetupArrays()
+    txt = "Creating reference!"
+    graph.create_text(graphWidth / 2 + graphLeftBuffer, graphTopBuffer + graphHeight / 2, text=txt,
+                      font=tkFont.Font(size=32), fill='Red')
+    root.update()
+    
+    # Začni zajem podatkov za kalibracijo v ločeni niti ali funkciji
+    start_calibration_sweep()
+    
+    # Počakaj, da je kalibracija končana (s timeout-om)
+    timeout = 10  # sekunde
+    start_time = time.time()
+    while not refReady and app_running and time.time() - start_time < timeout:
+        sleep(0.1)  # Ne obremenjuj procesorja s hitrim preverjanjem
+        root.update()  # Omogoči GUI posodobitve
+
+    if not refReady:
+      messagebox.showerror("Calibration Error", "Calibration Timed Out.")
+
+    # Ko je kalibracija končana ali je prišlo do timeout-a
+    measMode = 1
+    UpdateGraph()
+    
+def start_calibration_sweep():
+    global readings, refReady, startFreq, stopFreq, numSamplesList, numSamplesIndex #dodatno
+    global graphWidth, graphHeight, graphLeftBuffer, graphTopBuffer, dBDivList, dBDivIndex, refLevel #dodatno
+    # Simulacija zajema podatkov (zamenjaj s pravo implementacijo)
+    def simulate_data_capture(i):
+        global readings, refReady
+        
+        # Simuliraj zajem podatkov
+        readings[1::2] = np.random.rand(len(readings[1::2])) * 10  # Naključne vrednosti
+        #readings[1::2] = 1  # Naključne vrednosti
+        if i < 10:  # Simuliraj več korakov zajema
+            root.after(500, lambda: simulate_data_capture(i + 1))  # Počakaj 500ms in ponovi
+        else:
+            # Ko je zajem končan, nastavi refReady na True
+            refReady = True
+            print("Calibration data capture complete!")
+            UpdateGraph()
+
+    simulate_data_capture(0)  # Začni simulacijo
+
+def auto_range():
+    global refLevel, dBDivIndex, readings, startFreq, stopFreq, graphWidth, graphHeight, graphLeftBuffer, graphTopBuffer, vDiv, dBDivList
+    if not np.any(readings):
+        messagebox.showinfo("Info", "No data to auto-range.")
+        return
+    min_db = np.min(readings[1::2])
+    max_db = np.max(readings[1::2])
+    total_range = max_db - min_db
+    for i, div in enumerate(dBDivList):
+        if total_range <= vDiv * div:
+            dBDivIndex = i
+            break
+    else:
+        dBDivIndex = len(dBDivList) - 1
+    refLevel = max_db + (vDiv * dBDivList[dBDivIndex] - total_range) / 2
+    refLevel = min(20, refLevel)
+    refLevel = max(-60, refLevel)
+    UpdateGraph()
+
+def start_sweep():
+    global sweep_running, SERIALPORT, BAUD, resetSweep # added resetSweep
+    global readings  # Access readings
+    global numSamplesList, numSamplesIndex
+    global app_running # added global app_running
+
+    if not sweep_running or not app_running: # Quick exit condition
+        return
+
+    try: # Serial handling wrapped
+        ser = serial.Serial(SERIALPORT, BAUD, timeout=0.1)
+        messagebox.showinfo("Serial Info", f"Connected to {SERIALPORT} @ {BAUD}")
+    except Exception as e:
+        messagebox.showerror("Serial Error", f"Failed to open serial port: {e}")
+        stop_sweep()  # Stop the sweep
+        return
+
+    resetSweep = True  # Initialize before starting
+    n = 0
+    try:
+        while sweep_running and app_running:  # Main loop
+            if resetSweep:
+                resetSweep = False #Set to false since we just reset
+                n = 0  # Local counter
+
+            FTW = str(int(readings[n * 2])) + '\n'  # Frequency tuning word
+            ser.write(FTW.encode())
+
+            ser.write(b'p\n') #Byte literal
+
+            adcValue = ser.readline().decode().strip()
+
+            if adcValue: # only if we successfully get an adc Value
+                readings[n*2+1] = float(adcValue) * 0.5 * 0.0488 - 90.5
+                n+=1
+
+            if n >= numSamplesList[numSamplesIndex]:
+                resetSweep = True #Reset!
+                n=0  #Reset
+
+            UpdateGraph() # just call update graph and let it handle everything
+            #MakeTrace() #Update graph
+            root.update_idletasks() #Update GUI
+            root.update()
+            sleep(0.01)  # Short sleep not to busy-wait
+
+    except serial.SerialException as e:
+        messagebox.showerror("Serial Error", f"Serial communication error: {e}")
+    except Exception as e:
+        messagebox.showerror("General Error", f"An error occurred: {e}")
+    finally:  # Always execute at the end, used to close connection!
+        try: # added in a try
+          ser.close() # Ensure serial is always closed
+        except: # if serial close fails do nothing.
+          pass
+        stop_sweep() # Ensure a stop sweep is called
+    print("BSweep over.")
+
+def stop_sweep():
+    global sweep_running, start_button
+    sweep_running = False
+    try:
+        start_button.config(text="Start Sweep")
+    except:
+        pass
+
+def motion(event):
+    global cursor_x, cursor_y, startFreq, stopFreq, graphWidth, graphLeftBuffer, refLevel, graphTopBuffer, dBDivList, dBDivIndex, graphHeight, vDiv,cursor_text_id
+    cursor_x, cursor_y = event.x, event.y
+    UpdateCursorText()
+
+def UpdateCursorText():
+    global cursor_text_id, graphLeftBuffer, graphTopBuffer, graphWidth, graphHeight, startFreq, stopFreq, vDiv, dBDivList, dBDivIndex, refLevel, cursor_x, cursor_y
+    try:
+        frequency = startFreq + (cursor_x - graphLeftBuffer) * (stopFreq - startFreq) / graphWidth if graphWidth > 0 else 0
+        dbm = refLevel - (cursor_y - graphTopBuffer) * (vDiv * dBDivList[dBDivIndex]) / graphHeight if graphHeight > 0 else 0
+
+        text = f"Freq: {frequency/1000000:.3f} MHz, dBm: {dbm:.2f}"
+        if cursor_text_id:
+            graph.delete(cursor_text_id)
+        cursor_text_id = graph.create_text(graphLeftBuffer + 10, graphTopBuffer + 10, text=text, fill="white", anchor=NW, tag="cursor_text")
+
+    except Exception as e:
+        print(f"Error in UpdateCursorText: {e}")
+
+# ================ GUI Setup ===============================
+root = tk.Tk()
+root.resizable(True, True)
+root.title('Scalar Network Analyzer')
+
+root.grid_rowconfigure(3, weight=1)
+root.grid_columnconfigure(0, weight=1)
+
+menu_bar = Menu(root)
+root.config(menu=menu_bar)
+
+# Define a label to show cursor information
+cursor_info_label = Label(root, text="Freq: N/A MHz, dBm: N/A")
+cursor_info_label.grid(row=4, column=0, columnspan=3, sticky=(W, E))
+
+#serial_menu = Menu(menu_bar, tearoff=0)  #Odstranimo serial menu
+#menu_bar.add_cascade(label="Serial Port", menu=serial_menu)  #Odstranimo serial menu
+
+com_port_var = StringVar(value=SERIALPORT)
+baud_rate_var = StringVar(value=BAUD)
+
+baud_rates = [9600, 14400, 19200, 38400, 57600, 115200, 230400, 921600, 1000000]
+
+ports = [p.device for p in serial.tools.list_ports.comports()]
+
+# Define button width and height
+button_width = 6  # Width in text units
+button_height = 1  # Height in text units
+
+# Set up the style for the buttons
+style = ttk.Style()
+style.configure('TButton', padding=(10, 5), font=('Helvetica', 10))
+
+com_port_label = Label(root, text="COM PORT:", anchor="e") #desno
+com_port_label.grid(row=0, column=0, sticky=E)  # Zamenjaj W z E za poravnavo na desno
+com_port_combo = ttk.Combobox(root, textvariable=com_port_var, values=ports)
+com_port_combo.grid(row=0, column=2, sticky=(E, W)) #desno v stolpec 2
+
+baud_rate_label = Label(root, text="BAUD RATE:", anchor="e") #desno
+baud_rate_label.grid(row=1, column=0, sticky=E)  # Zamenjaj W z E za poravnavo na desno
+baud_rate_combo = ttk.Combobox(root, textvariable=baud_rate_var, values=baud_rates)
+baud_rate_combo.grid(row=1, column=2, sticky=(E, W)) #desno v stolpec 2
+
+# Novi gumb "Set Port"
+set_port_button = ttk.Button(root, text="Set Port", width=10, command=open_serial_port)
+set_port_button.grid(row=2, column=2, sticky=E, pady=5)  # Postavimo pod baud rate combo
+
+window = ttk.Frame(root, padding=5)
+window.grid(column=0, row=3, sticky=(tk.N, tk.E, tk.S, tk.W)) #row = 3 ker dodamo eno vrstico zgoraj
+window.grid_columnconfigure(0, weight=1)
+window.grid_rowconfigure(0, weight=1)
+
+graph = Canvas(window, width=graphWidth, height=graphHeight, background='black') #SPREMENJENO
+graph.bind("<Configure>", lambda event: UpdateGraph()) # DODANO
+graph.grid(column=0, row=0, sticky=(tk.N, tk.E, tk.S, tk.W))
+graph.bind("<Motion>", motion)
+
+controlArea = ttk.LabelFrame(window, text="Controls", borderwidth=10)
+controlArea.grid(column=0, row=1, sticky=(N, E, S, W))
+
+# Create a frame to hold the buttons
+button_frame = ttk.Frame(root)
+button_frame.grid(row=3, column=2, sticky=(N, E, S, W))
+
+# Configure grid layout for the button frame
+for i in range(16):  # Assuming 16 rows of buttons
+    button_frame.rowconfigure(i, weight=1)
+    button_frame.columnconfigure(0, weight=1)  # Single column
+
+# Create buttons with consistent styling and layout
+button_params = {
+    "button_frame": button_frame, "width": button_width, "style": 'TButton', "sticky": E, "pady": 5
+}
+
+db_div_inc_button = ttk.Button(**button_params, text="dB/div +", command=BdBDivInc)
+db_div_inc_button.grid(row=3, column=0, sticky=(E,W), pady=5)
+
+db_div_dec_button = ttk.Button(**button_params, text="dB/div -", command=BdBDivDec)
+db_div_dec_button.grid(row=4, column=0, sticky=(E,W), pady=5)
+
+ref_lvl_inc_10_button = ttk.Button(**button_params, text="Ref Lvl +10", command=BrefLevelIncTen)
+ref_lvl_inc_10_button.grid(row=5, column=0, sticky=(E,W), pady=5)
+
+ref_lvl_dec_10_button = ttk.Button(**button_params, text="Ref Lvl -10", command=BrefLevelDecTen)
+ref_lvl_dec_10_button.grid(row=6, column=0, sticky=(E,W), pady=5)
+
+ref_lvl_inc_1_button = ttk.Button(**button_params, text="Ref Lvl +1", command=BrefLevelIncOne)
+ref_lvl_inc_1_button.grid(row=7, column=0, sticky=(E,W), pady=5)
+
+ref_lvl_dec_1_button = ttk.Button(**button_params, text="Ref Lvl -1", command=BrefLevelDecOne)
+ref_lvl_dec_1_button.grid(row=8, column=0, sticky=(E,W), pady=5)
+
+inc_samples_button = ttk.Button(**button_params, text="+ Samples", command=BIncSampSweep)
+inc_samples_button.grid(row=9, column=0, sticky=(E,W), pady=5)
+
+dec_samples_button = ttk.Button(**button_params, text="- Samples", command=BDecSampSweep)
+dec_samples_button.grid(row=10, column=0, sticky=(E,W), pady=5)
+
+set_freqs_button = ttk.Button(**button_params, text="Set Freqs", command=BSetFreqs)
+set_freqs_button.grid(row=11, column=0, sticky=(E,W), pady=5)
+
+calibrate_button = ttk.Button(**button_params, text="Calibrate", command=BCalibrate)
+calibrate_button.grid(row=12, column=0, sticky=(E,W), pady=5)
+
+auto_range_button = ttk.Button(**button_params, text="Auto Range", command=auto_range)
+auto_range_button.grid(row=13, column=0, sticky=(E,W), pady=5)
+
+start_button = ttk.Button(**button_params, text="Start Sweep", command=start_sweep)
+start_button.grid(row=14, column=0, sticky=(E,W), pady=5)
+
+close_button = ttk.Button(**button_params, text="Close", command=on_closing)
+close_button.grid(row=15, column=0, sticky=(E,W), pady=5)
+
+UpdateCursorText()
+
+# ================ Call main routine ===============================
+root.update()
+SetupArrays()
+UpdateGraph()
+
+root.protocol("WM_DELETE_WINDOW", on_closing) # handle window closing event directly
+#root.bind("<Destroy>", on_closing)  #Another solution
+
+root.mainloop()
